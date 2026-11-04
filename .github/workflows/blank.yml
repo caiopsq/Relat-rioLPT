@@ -1,0 +1,114 @@
+name: Atualizar relatório público
+
+on:
+  schedule:
+    - cron: "17 12 * * 1" # Segunda-feira, 09:17 em Brasília
+  workflow_dispatch:
+
+concurrency:
+  group: github-pages
+  cancel-in-progress: false
+
+jobs:
+  publicar:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.ENTRA_CLIENT_ID }}
+          tenant-id: ${{ secrets.ENTRA_TENANT_ID }}
+          allow-no-subscriptions: true
+
+      - name: Baixar Excel privado e gerar JSON público
+        env:
+          DRIVE_ID: ${{ vars.SHAREPOINT_DRIVE_ID }}
+          ITEM_ID: ${{ vars.SHAREPOINT_ITEM_ID }}
+          SHEET: ${{ vars.EXCEL_ABA }}
+          TABLE: ${{ vars.EXCEL_TABELA }}
+        shell: bash
+        run: |
+          : "${DRIVE_ID:?Configure SHAREPOINT_DRIVE_ID}"
+          : "${ITEM_ID:?Configure SHAREPOINT_ITEM_ID}"
+          : "${SHEET:?Configure EXCEL_ABA}"
+          : "${TABLE:?Configure EXCEL_TABELA}"
+
+          temporary="$(mktemp -d)"
+          trap 'rm -rf "$temporary"' EXIT
+          export EXCEL_PATH="$temporary/origem.xlsx"
+          token="$(az account get-access-token --resource-type ms-graph --query accessToken -o tsv)"
+          curl --fail --silent --show-error --location --proto '=https' \
+            --header "Authorization: Bearer $token" \
+            --output "$EXCEL_PATH" \
+            "https://graph.microsoft.com/v1.0/drives/$DRIVE_ID/items/$ITEM_ID/content"
+          unset token
+
+          python3 -m venv "$temporary/venv"
+          "$temporary/venv/bin/python" -m pip install --quiet 'openpyxl==3.1.5'
+          "$temporary/venv/bin/python" - <<'PYCODE'
+          import json
+          import math
+          import os
+          import re
+          from pathlib import Path
+
+          from openpyxl import load_workbook
+
+          public = Path("public")
+          if not (public / "index.html").is_file():
+              raise SystemExit("Coloque o relatório em public/index.html.")
+
+          workbook = load_workbook(os.environ["EXCEL_PATH"], data_only=True)
+          sheet_name, table_name = os.environ["SHEET"], os.environ["TABLE"]
+          if sheet_name not in workbook or table_name not in workbook[sheet_name].tables:
+              raise SystemExit("Confira EXCEL_ABA e EXCEL_TABELA.")
+          sheet = workbook[sheet_name]
+          table = sheet.tables[table_name]
+          cells = sheet[table.ref]
+          columns = [cell.value for cell in cells[0]]
+          if any(columns.count(name) != 1 for name in ("Mês", "Total")):
+              raise SystemExit("A tabela precisa ter os cabeçalhos Mês e Total.")
+
+          month_column = columns.index("Mês")
+          total_column = columns.index("Total")
+          totals_rows = table.totalsRowCount or int(bool(table.totalsRowShown))
+          rows = []
+          for row in cells[1:len(cells) - totals_rows]:
+              month = row[month_column].value
+              total = row[total_column].value
+              if month is None and total is None:
+                  continue
+              if not isinstance(month, str) or not re.fullmatch(r"[0-9]{4}-(0[1-9]|1[0-2])", month):
+                  raise SystemExit(f"Linha {row[0].row}: Mês deve ser texto AAAA-MM.")
+              if type(total) not in (int, float) or not math.isfinite(total):
+                  raise SystemExit(f"Linha {row[0].row}: Total deve ser numérico e finito.")
+              rows.append({"mes": month, "total": total})
+
+          if not rows:
+              raise SystemExit("A tabela não contém dados publicáveis.")
+
+          (public / "dados-publicos.json").write_text(
+              json.dumps(rows, ensure_ascii=False, allow_nan=False) + "\n",
+              encoding="utf-8",
+          )
+          PYCODE
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: public
+
+      - name: Publicar no GitHub Pages
+        id: deploy
+        uses: actions/deploy-pages@v4
